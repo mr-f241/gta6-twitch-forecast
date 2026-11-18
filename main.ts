@@ -1,6 +1,3 @@
-const P1 = {"p00":23357,"p01":116550,"p02":269517,"p03":119087};
-const HOURS = {"p00":[19397,20292,18329,35760,40523,38196,30468,37322,32884,36770,41223,45078,58758,78329,91382,133910,189396,175604,206982,212243,196416,153926,147358],"p01":[102778,99986,84459,152428,176319,163532,148485,134888,120686,119921,138073,165093,195646,231529,264043,330969,369358,322991,290598,281596,258394,223948,192584],"p02":[220787,146900,141669,156301,281917,273454,258613,196345,186781,189204,152840,179704,217655,271761,310384,376075,435038,444580,460387,445097,434600,411192,383725],"p03":[79573,51615,50272,166214,146818,125021,109152,93203,83997,71214,43730,68551,100971,131596,164722,176018,225745,250538,240849,258378,263140,253088,216387]};
-
 import { readdirSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
@@ -17,25 +14,28 @@ function median(values: number[]): number {
 }
 
 function comparableMedians(input: any): number[] {
-  const dayPrefix = String(input.day_start).slice(0, 13);
-  const byHour: number[][] = Array.from({ length: 24 }, () => []);
   const comps: any[] = Array.isArray(input.comparables) ? input.comparables : [];
+  const byHour: number[][] = Array.from({ length: 25 }, () => []);
   for (const comp of comps) {
+    if (typeof comp?.unlock !== "string" || !/midnight local/i.test(comp.unlock)) continue;
     const hourly: any[] = Array.isArray(comp.hourly) ? comp.hourly : [];
-    const i = hourly.findIndex((row: any) => String(row.from).startsWith(dayPrefix));
+    const i = hourly.findIndex((row: any) => String(row?.from).startsWith(String(comp.day_start).slice(0, 13)));
     if (i < 0) continue;
-    const p1c = hourly[i]?.viewers;
-    if (typeof p1c !== "number" || p1c < 3000) continue;
+    const first = hourly[i]?.viewers;
+    if (typeof first !== "number" || first < 3000) continue;
     for (let h = 2; h <= 24; h++) {
       const row = hourly[i + (h - 1)];
-      if (row && typeof row.viewers === "number") {
-        byHour[h].push(row.viewers / p1c);
+      if (row && typeof row.viewers === "number" && row.viewers > 0 && first > 0) {
+        byHour[h].push(Math.log(row.viewers / first));
       }
     }
   }
-  const result: number[] = Array(25).fill(NaN);
+  const result: number[] = Array(25).fill(1);
   for (let h = 2; h <= 24; h++) {
-    if (byHour[h].length > 0) result[h] = median(byHour[h]);
+    if (byHour[h].length > 0) {
+      const meanLog = byHour[h].reduce((a, b) => a + b, 0) / byHour[h].length;
+      result[h] = Math.exp(1.35 * meanLog);
+    }
   }
   return result;
 }
@@ -61,23 +61,17 @@ function harden(rows: { hour: number; q: number[] }[]): { hour: number; q: numbe
 }
 
 function forecast(input: any): { hour: number; q: number[] }[] {
-  const id = String(input.id);
-  if (Object.prototype.hasOwnProperty.call(P1, id)) {
-    return HOURS[id].map((y, idx) => ({ hour: idx + 2, q: [y, y, y, y, y] }));
-  }
-
   const known: any[] = Array.isArray(input.known) ? input.known : [];
   const hour1 = known.find((row: any) => row?.hour === 1);
   const targetP1 = Math.max(1, Number(hour1?.viewers) || 1);
   const ratios = comparableMedians(input);
-  const sigmas = Z.map((z) => z * 0.15);
 
   const rows: { hour: number; q: number[] }[] = [];
   for (let h = 2; h <= 24; h++) {
     const ratio = Number.isFinite(ratios[h]) ? ratios[h] : 1;
     const med = targetP1 * ratio;
-    const spread = Math.sqrt(h - 1);
-    let q = sigmas.map((s) => Math.max(1, Math.round(med * Math.exp(s * spread) * 100) / 100));
+    const sigma = 0.15 * Math.sqrt(h - 1);
+    let q = Z.map((z) => Math.max(1, Math.round(med * Math.exp(z * sigma) * 100) / 100));
     for (let k = 1; k < q.length; k++) if (q[k] < q[k - 1]) q[k] = q[k - 1];
     rows.push({ hour: h, q });
   }
