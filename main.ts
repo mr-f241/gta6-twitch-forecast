@@ -6,37 +6,6 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR!;
 
 const Z = [-1.645, -0.674, 0, 0.674, 1.645];
 
-function comparableMedians(input: any, targetP1: number): number[] {
-  const comps: any[] = Array.isArray(input.comparables) ? input.comparables : [];
-  const logWeights: number[] = Array(25).fill(0);
-  const weightSums: number[] = Array(25).fill(0);
-  for (const comp of comps) {
-    if (typeof comp?.unlock !== "string" || !/midnight local/i.test(comp.unlock)) continue;
-    const hourly: any[] = Array.isArray(comp.hourly) ? comp.hourly : [];
-    const i = hourly.findIndex((row: any) => String(row?.from).startsWith(String(comp.day_start).slice(0, 13)));
-    if (i < 0) continue;
-    const first = hourly[i]?.viewers;
-    if (typeof first !== "number" || first < 3000 || first <= 0 || targetP1 <= 0) continue;
-    const weight = Math.exp(-2.5 * Math.abs(Math.log(first / targetP1)));
-    for (let h = 2; h <= 24; h++) {
-      const row = hourly[i + (h - 1)];
-      if (row && typeof row.viewers === "number" && row.viewers > 0) {
-        const lr = Math.log(row.viewers / first);
-        logWeights[h] += weight * lr;
-        weightSums[h] += weight;
-      }
-    }
-  }
-  const result: number[] = Array(25).fill(1);
-  for (let h = 2; h <= 24; h++) {
-    if (weightSums[h] > 0) {
-      const weightedMean = logWeights[h] / weightSums[h];
-      result[h] = Math.exp(1.2 * weightedMean);
-    }
-  }
-  return result;
-}
-
 function harden(rows: { hour: number; q: number[] }[]): { hour: number; q: number[] }[] {
   const byHour = new Map(rows.map((r) => [r.hour, r]));
   const out: { hour: number; q: number[] }[] = [];
@@ -61,14 +30,72 @@ function forecast(input: any): { hour: number; q: number[] }[] {
   const known: any[] = Array.isArray(input.known) ? input.known : [];
   const hour1 = known.find((row: any) => row?.hour === 1);
   const targetP1 = Math.max(1, Number(hour1?.viewers) || 1);
-  const ratios = comparableMedians(input, targetP1);
+  const targetX = Math.log(targetP1);
+
+  const comps: any[] = Array.isArray(input.comparables) ? input.comparables : [];
+  const localMidnight: any[] = comps.filter((comp) => typeof comp?.unlock === "string" && /midnight local/i.test(comp.unlock));
 
   const rows: { hour: number; q: number[] }[] = [];
   for (let h = 2; h <= 24; h++) {
-    const ratio = Number.isFinite(ratios[h]) ? ratios[h] : 1;
-    const med = targetP1 * ratio;
-    const sigma = 0.10 * Math.sqrt(h - 1);
-    let q = Z.map((z) => Math.max(1, Math.round(med * Math.exp(z * sigma) * 100) / 100));
+    const xs: number[] = [];
+    const ys: number[] = [];
+    const ws: number[] = [];
+    for (const comp of localMidnight) {
+      const hourly: any[] = Array.isArray(comp.hourly) ? comp.hourly : [];
+      const i = hourly.findIndex((row: any) => String(row?.from).startsWith(String(comp.day_start).slice(0, 13)));
+      if (i < 0) continue;
+      const first = hourly[i]?.viewers;
+      const row = hourly[i + (h - 1)];
+      if (typeof first !== "number" || first < 3000 || first <= 0) continue;
+      if (!row || typeof row.viewers !== "number" || row.viewers <= 0) continue;
+      const x = Math.log(first);
+      const y = Math.log(row.viewers);
+      const w = Math.exp(-0.5 * Math.abs(x - targetX));
+      xs.push(x);
+      ys.push(y);
+      ws.push(w);
+    }
+
+    if (xs.length === 0) {
+      const sigma = 0.15 * Math.sqrt(h - 1);
+      const med = targetP1;
+      let q = Z.map((z) => Math.max(1, Math.round(med * Math.exp(z * sigma) * 100) / 100));
+      for (let k = 1; k < q.length; k++) if (q[k] < q[k - 1]) q[k] = q[k - 1];
+      rows.push({ hour: h, q });
+      continue;
+    }
+
+    let wSum = 0, wxSum = 0, wySum = 0;
+    for (let j = 0; j < xs.length; j++) {
+      wSum += ws[j];
+      wxSum += ws[j] * xs[j];
+      wySum += ws[j] * ys[j];
+    }
+    const xbar = wSum > 0 ? wxSum / wSum : 0;
+    const ybar = wSum > 0 ? wySum / wSum : 0;
+
+    let sxx = 0, sxy = 0;
+    for (let j = 0; j < xs.length; j++) {
+      sxx += ws[j] * (xs[j] - xbar) * (xs[j] - xbar);
+      sxy += ws[j] * (xs[j] - xbar) * (ys[j] - ybar);
+    }
+
+    let slope = 1;
+    if (sxx !== 0) slope = sxy / sxx;
+    const intercept = ybar - slope * xbar;
+
+    let sse = 0;
+    for (let j = 0; j < xs.length; j++) {
+      const pred = intercept + slope * xs[j];
+      const resid = ys[j] - pred;
+      sse += ws[j] * resid * resid;
+    }
+    const residualSD = wSum > 0 ? Math.sqrt(sse / wSum) : 0;
+
+    const prediction = intercept + slope * targetX;
+    const width = 0.6 * residualSD + 0.01 * Math.sqrt(h - 1);
+    const med = Math.exp(prediction);
+    let q = Z.map((z) => Math.max(1, Math.round(med * Math.exp(z * width) * 100) / 100));
     for (let k = 1; k < q.length; k++) if (q[k] < q[k - 1]) q[k] = q[k - 1];
     rows.push({ hour: h, q });
   }
